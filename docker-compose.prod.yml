@@ -6,9 +6,14 @@ version: "3.9"
 # pre-built images pushed to ECR by the GitHub Actions pipeline.
 #
 # Expects a .env file (deployed by the pipeline) providing:
-#   ECR_REGISTRY, ECR_REPOSITORY, IMAGE_TAG,
+#   ECR_REGISTRY, ECR_REPOSITORY_BACKEND, ECR_REPOSITORY_FRONTEND, IMAGE_TAG,
 #   MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD,
 #   JWT_SECRET, JWT_EXPIRES_IN, NGINX_PORT
+#
+# nginx uses the public nginx:1.27-alpine image directly, with
+# job-portal/nginx/nginx.conf bind-mounted in from the synced repo --
+# no separate ECR repo or build needed for it since it's just a
+# reverse proxy with no custom code.
 #
 # Run with:  docker compose -f docker-compose.prod.yml up -d
 # =====================================================================
@@ -36,7 +41,7 @@ services:
       start_period: 30s
 
   backend:
-    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${IMAGE_TAG}
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG}
     container_name: job-portal-backend
     restart: unless-stopped
     environment:
@@ -65,7 +70,7 @@ services:
       start_period: 20s
 
   frontend:
-    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${IMAGE_TAG}
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG}
     container_name: job-portal-frontend
     restart: unless-stopped
     depends_on:
@@ -81,12 +86,14 @@ services:
       start_period: 15s
 
   nginx:
-    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:nginx-${IMAGE_TAG}
+    image: nginx:1.27-alpine
     container_name: job-portal-nginx
     restart: unless-stopped
     ports:
       # ALB target group forwards HTTP traffic here on port 80
       - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./job-portal/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       frontend:
         condition: service_healthy
@@ -95,7 +102,9 @@ services:
     networks:
       - job-portal-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/healthz"]
+      # Plain-alpine nginx has no curl/wget installed, so use busybox ash's
+      # /dev/tcp for a lightweight port-open check instead of an HTTP GET.
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/80 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
