@@ -21,7 +21,8 @@ set -a && source .env && set +a
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 : "${ECR_REGISTRY:?ECR_REGISTRY must be set}"
-: "${ECR_REPOSITORY:?ECR_REPOSITORY must be set}"
+: "${ECR_REPOSITORY_BACKEND:?ECR_REPOSITORY_BACKEND must be set}"
+: "${ECR_REPOSITORY_FRONTEND:?ECR_REPOSITORY_FRONTEND must be set}"
 : "${IMAGE_TAG:?IMAGE_TAG must be set}"
 
 echo ">>> Logging in to Amazon ECR ($ECR_REGISTRY)"
@@ -51,4 +52,7 @@ curl -f http://localhost/healthz || (echo "Local health check failed" && exit 1)
 echo ">>> Pruning old, unused images"
 docker image prune -af --filter "until=48h" || true
 
-echo ">>> Deploy complete: $ECR_REGISTRY/$ECR_REPOSITORY (tag: $IMAGE_TAG)"
+echo ">>> Deploy complete:"
+echo "    backend:  $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG"
+echo "    frontend: $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG"
+echo "    nginx:    nginx:1.27-alpine (public image, unchanged)"
