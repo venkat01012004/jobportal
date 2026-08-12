@@ -13,21 +13,28 @@ name: Job Portal CI/CD
 #
 # Required GitHub Secrets (matches this repo's existing secret names):
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
-#   AWS_REGISTRY                   (full ECR registry URL, e.g.
+#   AWS_REGISTRY                   (full ECR registry URL, shared by both repos, e.g.
 #                                    123456789012.dkr.ecr.us-east-1.amazonaws.com)
-#   AWS_REPOSITORY                 (e.g. job-portal -- one repo, multiple tags)
+#   AWS_REPOSITORY_BACKEND         (name of the backend ECR repo, e.g. job-portal-backend)
+#   AWS_REPOSITORY_FRONTEND        (name of the frontend ECR repo, e.g. job-portal-frontend)
 #   EC2_HOST, EC2_USERNAME, EC2_SSH_KEY   (single EC2 box acts as the host)
 #   TARGET_GROUP_ARN               (arn:aws:elasticloadbalancing:...:targetgroup/...)
 #   ALB_DNS_NAME                   (job-portal-alb-xxxxxxxx.region.elb.amazonaws.com)
 #   MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD, JWT_SECRET
+#
+# NOTE: nginx uses the public nginx:1.27-alpine image directly (config is
+# bind-mounted from job-portal/nginx/nginx.conf on the EC2 host after the
+# repo sync) -- no ECR repo or build step needed for it, since it's just a
+# reverse proxy with no custom code.
 #
 # NOTE: only one EC2 instance is used (EC2_HOST). Its instance-id is not
 # stored as a secret -- the register-target-group job resolves it at run
 # time from EC2_HOST via `aws ec2 describe-instances`, so there's one less
 # secret to keep in sync if the box is ever replaced.
 #
-# Required ECR repo (create once, outside this pipeline):
-#   aws ecr create-repository --repository-name job-portal
+# Required ECR repos (create once, outside this pipeline):
+#   aws ecr create-repository --repository-name job-portal-backend
+#   aws ecr create-repository --repository-name job-portal-frontend
 # =====================================================================
 
 on:
@@ -39,7 +46,8 @@ on:
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.AWS_REGISTRY }}
-  ECR_REPOSITORY: ${{ secrets.AWS_REPOSITORY }}
+  ECR_REPOSITORY_BACKEND: ${{ secrets.AWS_REPOSITORY_BACKEND }}
+  ECR_REPOSITORY_FRONTEND: ${{ secrets.AWS_REPOSITORY_FRONTEND }}
   DEPLOY_DIR: /opt/job-portal
 
 jobs:
@@ -90,10 +98,10 @@ jobs:
         include:
           - service: backend
             context: ./job-portal/backend
+            repo: ${{ secrets.AWS_REPOSITORY_BACKEND }}
           - service: frontend
             context: ./job-portal/frontend
-          - service: nginx
-            context: ./job-portal/nginx
+            repo: ${{ secrets.AWS_REPOSITORY_FRONTEND }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,10 +123,10 @@ jobs:
         working-directory: ${{ matrix.context }}
         run: |
           docker build \
-            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }} \
-            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ matrix.service }}-latest .
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ matrix.service }}-latest
+            -t ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ github.sha }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:latest .
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ github.sha }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:latest
 
   # -------------------------------------------------------------
   # 3. Deploy to EC2
@@ -186,7 +194,8 @@ jobs:
           REACT_APP_API_URL=/api
           NGINX_PORT=80
           ECR_REGISTRY=${{ env.ECR_REGISTRY }}
-          ECR_REPOSITORY=${{ env.ECR_REPOSITORY }}
+          ECR_REPOSITORY_BACKEND=${{ env.ECR_REPOSITORY_BACKEND }}
+          ECR_REPOSITORY_FRONTEND=${{ env.ECR_REPOSITORY_FRONTEND }}
           IMAGE_TAG=${{ github.sha }}
           EOF
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
@@ -288,6 +297,8 @@ jobs:
           echo "| **Commit SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **EC2 Host** | ${{ secrets.EC2_HOST }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **ALB DNS** | ${{ secrets.ALB_DNS_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ECR Repository** | ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Backend Image** | ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_BACKEND }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Frontend Image** | ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_FRONTEND }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Nginx Image** | nginx:1.27-alpine (public, config bind-mounted) |" >> $GITHUB_STEP_SUMMARY
           echo "| **Services Deployed** | backend, frontend, nginx |" >> $GITHUB_STEP_SUMMARY
           echo "| **Status** | Completed |" >> $GITHUB_STEP_SUMMARY
