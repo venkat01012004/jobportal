@@ -94,6 +94,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false   # let both matrix jobs finish so real errors aren't masked by a cancellation
       matrix:
         include:
           - service: backend
