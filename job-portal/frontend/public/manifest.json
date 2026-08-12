@@ -1,0 +1,9 @@
+{
+  "short_name": "Job Portal",
+  "name": "Job Portal - Job Seekers & Recruiters",
+  "icons": [],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#12203D",
+  "background_color": "#F5F6FA"
+}
