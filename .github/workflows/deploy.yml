@@ -1,74 +1,107 @@
 name: Job Portal CI/CD
 
+# =====================================================================
+# Pipeline:
+#   1. test-backend / test-frontend  -> unit tests
+#   2. build-and-push                -> Docker build + ECR push
+#   3. deploy-to-ec2                 -> SSH into EC2 + deploy
+#   4. register-target-group         -> Register EC2 with ALB
+#   5. verify-deployment             -> Check ALB health
+# =====================================================================
+
 on:
   push:
     branches: [ main ]
+
   pull_request:
     branches: [ main ]
 
+
+# =====================================================================
+# Global Environment Variables
+# =====================================================================
+
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+
   ECR_REGISTRY: ${{ secrets.AWS_REGISTRY }}
-  ECR_REPOSITORY_BACKEND: ${{ secrets.AWS_REPOSITORY_BACKEND }}
-  ECR_REPOSITORY_FRONTEND: ${{ secrets.AWS_REPOSITORY_FRONTEND }}
+
+  # Actual ECR repository names
+  ECR_REPOSITORY_BACKEND: backend
+  ECR_REPOSITORY_FRONTEND: frontend
+
   DEPLOY_DIR: /opt/job-portal
+
 
 jobs:
 
-  # =============================================================
+  # ===================================================================
   # 1. Backend Unit Tests
-  # =============================================================
+  # ===================================================================
+
   test-backend:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: npm
           cache-dependency-path: ./job-portal/backend/package-lock.json
 
-      - name: Install dependencies
+      - name: Install backend dependencies
         working-directory: ./job-portal/backend
         run: npm install
 
-      - name: Run tests
+      - name: Run backend tests
         working-directory: ./job-portal/backend
         run: npm test --if-present
 
 
-  # =============================================================
+  # ===================================================================
   # 2. Frontend Unit Tests
-  # =============================================================
+  # ===================================================================
+
   test-frontend:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: npm
           cache-dependency-path: ./job-portal/frontend/package-lock.json
 
-      - name: Install dependencies
+      - name: Install frontend dependencies
         working-directory: ./job-portal/frontend
         run: npm install
 
-      - name: Run tests
+      - name: Run frontend tests
         working-directory: ./job-portal/frontend
         run: npm test -- --watchAll=false --passWithNoTests
 
 
-  # =============================================================
+  # ===================================================================
   # 3. Build Docker Images and Push to Amazon ECR
-  # =============================================================
+  # ===================================================================
+
   build-and-push:
-    needs: [test-backend, test-frontend]
+    needs:
+      - test-backend
+      - test-frontend
+
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     runs-on: ubuntu-latest
 
     strategy:
@@ -77,39 +110,76 @@ jobs:
       matrix:
         include:
 
+          # Backend
           - service: backend
             context: ./job-portal/backend
-            repo: job-portal-backend
+            repo: backend
 
+          # Frontend
           - service: frontend
             context: ./job-portal/frontend
-            repo: job-portal-frontend
+            repo: frontend
+
 
     steps:
 
-      - uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+
+      # ---------------------------------------------------------------
+      # Configure AWS
+      # ---------------------------------------------------------------
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
+
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
           aws-region: ${{ env.AWS_REGION }}
 
+
+      # ---------------------------------------------------------------
+      # Login to ECR
+      # ---------------------------------------------------------------
+
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+
+      # ---------------------------------------------------------------
+      # Docker Build + Push
+      # ---------------------------------------------------------------
+
+      - name: Build Docker image
         working-directory: ${{ matrix.context }}
+
         run: |
+
+          echo "Building ${{ matrix.service }} image..."
+
+          echo "Repository: ${{ matrix.repo }}"
+
+          echo "Registry: ${{ env.ECR_REGISTRY }}"
 
           docker build \
             -t ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ github.sha }} \
             -t ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:latest .
+
+
+      - name: Push Docker image
+        working-directory: ${{ matrix.context }}
+
+        run: |
+
+          echo "Pushing ${{ matrix.service }} image..."
 
           docker push \
             ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ github.sha }}
@@ -118,37 +188,68 @@ jobs:
             ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:latest
 
 
-  # =============================================================
+  # ===================================================================
   # 4. Deploy to EC2
-  # =============================================================
+  # ===================================================================
+
   deploy-to-ec2:
     needs: build-and-push
+
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     runs-on: ubuntu-latest
+
 
     steps:
 
-      - uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+
+      # ---------------------------------------------------------------
+      # SSH Configuration
+      # ---------------------------------------------------------------
 
       - name: Set up SSH key
         env:
           PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
           HOST: ${{ secrets.EC2_HOST }}
+
         run: |
+
           mkdir -p ~/.ssh
+
           echo "$PRIVATE_KEY" > ~/.ssh/deploy_key
+
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh-keyscan -H "$HOST" \
+            >> ~/.ssh/known_hosts 2>/dev/null || true
+
+
+      # ---------------------------------------------------------------
+      # Create deployment directory
+      # ---------------------------------------------------------------
 
       - name: Ensure deploy directory exists on EC2
         env:
           HOST: ${{ secrets.EC2_HOST }}
           USER: ${{ secrets.EC2_USERNAME }}
+
         run: |
-          ssh -i ~/.ssh/deploy_key \
+
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "$USER@$HOST" \
-            "sudo mkdir -p ${{ env.DEPLOY_DIR }} && sudo chown -R \$(whoami):\$(whoami) ${{ env.DEPLOY_DIR }}"
+            "sudo mkdir -p ${{ env.DEPLOY_DIR }} && \
+             sudo chown -R \$(whoami):\$(whoami) \
+             ${{ env.DEPLOY_DIR }}"
+
+
+      # ---------------------------------------------------------------
+      # Sync GitHub repository to EC2
+      # ---------------------------------------------------------------
 
       - name: Sync repository to EC2
         env:
@@ -156,162 +257,323 @@ jobs:
           USER: ${{ secrets.EC2_USERNAME }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+
         run: |
+
           REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
 
-          ssh -i ~/.ssh/deploy_key \
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "$USER@$HOST" \
-            "REPO_URL='$REPO_URL' DEPLOY_DIR='${{ env.DEPLOY_DIR }}' bash -c '
+            "REPO_URL='$REPO_URL' \
+             DEPLOY_DIR='${{ env.DEPLOY_DIR }}' \
+             bash -c '
+
               if [ -d \"\$DEPLOY_DIR/.git\" ]; then
+
                 cd \"\$DEPLOY_DIR\"
+
                 git fetch origin main
+
                 git reset --hard origin/main
+
                 git clean -fd
+
               else
-                rm -rf \"\$DEPLOY_DIR\"/* \"\$DEPLOY_DIR\"/.[!.]* 2>/dev/null || true
-                git clone --branch main \"\$REPO_URL\" \"\$DEPLOY_DIR\"
+
+                rm -rf \"\$DEPLOY_DIR\"/* \
+                       \"\$DEPLOY_DIR\"/.[!.]* \
+                       2>/dev/null || true
+
+                git clone \
+                  --branch main \
+                  \"\$REPO_URL\" \
+                  \"\$DEPLOY_DIR\"
+
               fi
             '"
+
+
+      # ---------------------------------------------------------------
+      # Create production .env
+      # ---------------------------------------------------------------
 
       - name: Write .env file and copy to EC2
         env:
           HOST: ${{ secrets.EC2_HOST }}
           USER: ${{ secrets.EC2_USERNAME }}
+
         run: |
 
           cat > .env.deploy <<EOF
+
           MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}
+
           MYSQL_DATABASE=${{ secrets.MYSQL_DATABASE }}
+
           MYSQL_USER=${{ secrets.MYSQL_USER }}
+
           MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
+
           JWT_SECRET=${{ secrets.JWT_SECRET }}
+
           JWT_EXPIRES_IN=7d
+
           NODE_ENV=production
+
           REACT_APP_API_URL=/api
+
           NGINX_PORT=80
+
           ECR_REGISTRY=${{ env.ECR_REGISTRY }}
-          ECR_REPOSITORY_BACKEND=${{ env.ECR_REPOSITORY_BACKEND }}
-          ECR_REPOSITORY_FRONTEND=${{ env.ECR_REPOSITORY_FRONTEND }}
+
+          ECR_REPOSITORY_BACKEND=backend
+
+          ECR_REPOSITORY_FRONTEND=frontend
+
           IMAGE_TAG=${{ github.sha }}
+
           EOF
 
-          scp -i ~/.ssh/deploy_key \
+
+          scp \
+            -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             .env.deploy \
             "$USER@$HOST:${{ env.DEPLOY_DIR }}/.env"
 
+
           rm -f .env.deploy
+
+
+      # ---------------------------------------------------------------
+      # Run deployment script on EC2
+      # ---------------------------------------------------------------
 
       - name: Run deploy script on EC2
         env:
           HOST: ${{ secrets.EC2_HOST }}
           USER: ${{ secrets.EC2_USERNAME }}
+
         run: |
-          ssh -i ~/.ssh/deploy_key \
+
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "$USER@$HOST" \
-            "chmod +x '${{ env.DEPLOY_DIR }}/scripts/deploy-remote.sh' && \
+            "chmod +x \
+             '${{ env.DEPLOY_DIR }}/scripts/deploy-remote.sh' && \
              AWS_REGION='${{ env.AWS_REGION }}' \
-             bash '${{ env.DEPLOY_DIR }}/scripts/deploy-remote.sh'"
+             bash \
+             '${{ env.DEPLOY_DIR }}/scripts/deploy-remote.sh'"
 
 
-  # =============================================================
-  # 5. Register EC2 with ALB Target Group
-  # =============================================================
+  # ===================================================================
+  # 5. Register EC2 Instance with ALB Target Group
+  # ===================================================================
+
   register-target-group:
     needs: deploy-to-ec2
+
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     runs-on: ubuntu-latest
+
 
     steps:
 
+      # ---------------------------------------------------------------
+      # AWS credentials
+      # ---------------------------------------------------------------
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
+
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ---------------------------------------------------------------
+      # Find EC2 instance ID
+      # ---------------------------------------------------------------
 
       - name: Resolve EC2 instance ID from EC2_HOST
         id: resolve-instance
+
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
+
         run: |
 
-          for FILTER in "ip-address" "private-ip-address" "dns-name"; do
+          for FILTER in \
+            "ip-address" \
+            "private-ip-address" \
+            "dns-name"
+          do
 
             ID=$(aws ec2 describe-instances \
               --filters \
                 "Name=$FILTER,Values=$EC2_HOST" \
                 "Name=instance-state-name,Values=running" \
-              --query "Reservations[0].Instances[0].InstanceId" \
-              --output text 2>/dev/null || true)
+              --query \
+                "Reservations[0].Instances[0].InstanceId" \
+              --output text \
+              2>/dev/null || true)
+
 
             if [ -n "$ID" ] && [ "$ID" != "None" ]; then
+
               echo "Matched via $FILTER: $ID"
-              echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
+
+              echo "instance_id=$ID" \
+                >> "$GITHUB_OUTPUT"
+
               exit 0
+
             fi
 
           done
 
-          echo "ERROR: could not resolve an instance ID for EC2_HOST=$EC2_HOST" >&2
+
+          echo "ERROR: Could not resolve EC2 instance ID."
+
+          echo "EC2_HOST=$EC2_HOST"
+
           exit 1
+
+
+      # ---------------------------------------------------------------
+      # Register EC2 with Target Group
+      # ---------------------------------------------------------------
 
       - name: Register instance with target group
         run: |
+
           aws elbv2 register-targets \
-            --target-group-arn "${{ secrets.TARGET_GROUP_ARN }}" \
-            --targets Id=${{ steps.resolve-instance.outputs.instance_id }},Port=80
+            --target-group-arn \
+            "${{ secrets.TARGET_GROUP_ARN }}" \
+            --targets \
+            Id=${{ steps.resolve-instance.outputs.instance_id }},Port=80
+
+
+      # ---------------------------------------------------------------
+      # Wait until healthy
+      # ---------------------------------------------------------------
 
       - name: Wait for target to become healthy
         run: |
+
           aws elbv2 wait target-in-service \
-            --target-group-arn "${{ secrets.TARGET_GROUP_ARN }}" \
-            --targets Id=${{ steps.resolve-instance.outputs.instance_id }},Port=80
+            --target-group-arn \
+            "${{ secrets.TARGET_GROUP_ARN }}" \
+            --targets \
+            Id=${{ steps.resolve-instance.outputs.instance_id }},Port=80
 
 
-  # =============================================================
+  # ===================================================================
   # 6. Verify Deployment
-  # =============================================================
+  # ===================================================================
+
   verify-deployment:
     needs: register-target-group
+
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     runs-on: ubuntu-latest
+
 
     steps:
 
+      # ---------------------------------------------------------------
+      # AWS credentials
+      # ---------------------------------------------------------------
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
+
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ---------------------------------------------------------------
+      # Check Target Group Health
+      # ---------------------------------------------------------------
 
       - name: Check target group health
         run: |
+
           aws elbv2 describe-target-health \
-            --target-group-arn "${{ secrets.TARGET_GROUP_ARN }}" \
+            --target-group-arn \
+            "${{ secrets.TARGET_GROUP_ARN }}" \
             --output table
+
+
+      # ---------------------------------------------------------------
+      # Check ALB health endpoint
+      # ---------------------------------------------------------------
 
       - name: Curl the ALB endpoint
         run: |
-          curl -f "http://${{ secrets.ALB_DNS_NAME }}/healthz" || \
-            (echo "ALB health check failed" && exit 1)
+
+          curl -f \
+            "http://${{ secrets.ALB_DNS_NAME }}/healthz" \
+            || \
+            (
+              echo "ALB health check failed"
+              exit 1
+            )
+
+
+      # ---------------------------------------------------------------
+      # Deployment Summary
+      # ---------------------------------------------------------------
 
       - name: Deployment summary
         if: always()
+
         run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **EC2 Host** | ${{ secrets.EC2_HOST }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ALB DNS** | ${{ secrets.ALB_DNS_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Backend Image** | ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_BACKEND }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Frontend Image** | ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_FRONTEND }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Nginx Image** | nginx:1.27-alpine (public, config bind-mounted) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Services Deployed** | backend, frontend, nginx |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | Completed |" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Deployment Summary" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| Field | Value |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "|-------|-------|" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Commit SHA** | \`${{ github.sha }}\` |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **EC2 Host** | ${{ secrets.EC2_HOST }} |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **ALB DNS** | ${{ secrets.ALB_DNS_NAME }} |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Backend Image** | ${{ env.ECR_REGISTRY }}/backend |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Frontend Image** | ${{ env.ECR_REGISTRY }}/frontend |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Nginx Image** | nginx:1.27-alpine |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Services Deployed** | backend, frontend, nginx |" \
+            >> $GITHUB_STEP_SUMMARY
+
+          echo "| **Status** | Completed |" \
+            >> $GITHUB_STEP_SUMMARY
